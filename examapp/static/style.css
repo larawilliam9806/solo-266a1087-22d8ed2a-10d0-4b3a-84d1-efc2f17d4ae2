@@ -122,6 +122,10 @@ button:hover, .button:hover { filter: brightness(1.06); }
 .review-cell { min-width: 340px; }
 .review-form button { padding: 5px 10px; }
 
+.field { display: inline-flex; align-items: center; gap: 6px; }
+.pair-result th:not(:first-child), .pair-result td:not(:first-child) { text-align: right; }
+.pair-result td { font-variant-numeric: tabular-nums; }
+
 .table-wrap { overflow-x: auto; }
 
 table { border-collapse: collapse; width: 100%; }

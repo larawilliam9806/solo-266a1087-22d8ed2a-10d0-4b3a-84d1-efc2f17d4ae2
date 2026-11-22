@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import re
 from collections import OrderedDict
 
@@ -177,6 +178,9 @@ def build_forms(form_rows) -> "OrderedDict[int, dict]":
 
 def form_is_compatible(form: dict, card_rows: dict) -> bool:
     """Full-card question numbers match and every non-empty code/letter fits."""
+    if not form["qmap"]:
+        # A form with no mappings cannot be a candidate for any card.
+        return False
     if set(form["qmap"].keys()) != set(card_rows.keys()):
         return False
     for q_no, row in card_rows.items():
@@ -196,6 +200,10 @@ class Analysis:
         self.card_results: list[dict] = []
         self.unmatched_cards: list[dict] = []
         self.flagged: list[dict] = []
+        # Judgement inputs needed to re-run "these two options on these two
+        # questions" queries against this snapshot later, after forms change.
+        self.forms: list[dict] = []
+        self.cards: list[dict] = []
         self.cards_total = 0
         self.cards_matched = 0
 
@@ -222,11 +230,43 @@ def analyse(forms, card_rows_by_card: dict, decisions: dict) -> Analysis:
     codes = set()
     options: dict[str, set[str]] = {}
     for form in forms.values():
+        form_questions = []
+        for q_no in sorted(form["qmap"], key=_natural_key):
+            entry = form["qmap"][q_no]
+            form_questions.append({
+                "q_no": q_no,
+                "std_code": entry["std_code"],
+                "letters": dict(entry["letters"]),
+            })
+        result.forms.append({
+            "id": form["id"],
+            "name": form["name"],
+            "questions": form_questions,
+            "codes": sorted(form["codes"], key=_natural_key),
+        })
         for code, letters in form["options"].items():
             codes.add(code)
             options.setdefault(code, set()).update(letters)
     result.question_codes = sorted(codes, key=_natural_key)
     result.options = {c: sorted(options[c]) for c in result.question_codes}
+    result.cards = [
+        {
+            "card_no": card_no,
+            "rows": [
+                {
+                    "q_no": q_no,
+                    "letter": card_rows_by_card[card_no][q_no]["letter"],
+                    "scanned_code": card_rows_by_card[card_no][q_no]["scanned_code"],
+                }
+                for q_no in sorted(card_rows_by_card[card_no], key=_natural_key)
+            ],
+            # Filled in below: the compatible forms judged for this snapshot.
+            # Pair queries reuse this list instead of re-judging the card.
+            "form_ids": [],
+        }
+        for card_no in sorted(card_rows_by_card)
+    ]
+    card_details = {c["card_no"]: c for c in result.cards}
 
     all_forms = list(forms.values())
     for code in result.question_codes:
@@ -239,6 +279,7 @@ def analyse(forms, card_rows_by_card: dict, decisions: dict) -> Analysis:
     for card_no in sorted(card_rows_by_card):
         rows = card_rows_by_card[card_no]
         compatible = [f for f in all_forms if form_is_compatible(f, rows)]
+        card_details[card_no]["form_ids"] = [f["id"] for f in compatible]
         if not compatible:
             detail = "无可相容卷式（整卡题号不一致或非空题码/涂选字母不吻合）"
             result.unmatched_cards.append({"card_no": card_no, "detail": detail})
@@ -291,28 +332,9 @@ def analyse(forms, card_rows_by_card: dict, decisions: dict) -> Analysis:
                         "flagged", None, f"卷式归一作答分歧：{shown}"
                     )
 
-            if decision and status in ("flagged", "blank"):
-                # A human conclusion is only meaningful where the automatic
-                # verdict could not be trusted (disagreement / unprinted).
-                # Once a correction makes the cell consistent, recalculated
-                # statistics win and the stale conclusion stops applying.
-                res = decision["resolution"]
-                if res == "skip":
-                    status, option, detail = "skipped", None, (
-                        "人工核对：跳过（不计入）" +
-                        (f"；{decision['note']}" if decision.get("note") else "")
-                    )
-                elif res == "blank":
-                    status, option, detail = "blank", None, (
-                        "人工核对：漏答" +
-                        (f"；{decision['note']}" if decision.get("note") else "")
-                    )
-                elif res.startswith("opt:") and res[4:] in stat["options"]:
-                    chosen = res[4:]
-                    status, option, detail = "counted", chosen, (
-                        "人工核对：" + chosen +
-                        (f"；{decision['note']}" if decision.get("note") else "")
-                    )
+            applied = apply_decision(decision, status, stat["options"])
+            if applied is not None:
+                status, option, detail = applied
 
             if status == "skipped":
                 continue
@@ -333,6 +355,188 @@ def analyse(forms, card_rows_by_card: dict, decisions: dict) -> Analysis:
 
     result.flagged.sort(key=lambda x: (_natural_key(x["card_no"]), _natural_key(x["std_code"])))
     return result
+
+
+def apply_decision(decision, status, option_universe):
+    """Apply a human conclusion to an automatic cell verdict.
+
+    Returns (status, option, detail) or None when the conclusion does not
+    apply.  A conclusion is only meaningful where the automatic verdict could
+    not be trusted (disagreement / unprinted / blank); once a correction makes
+    the cell consistent, recalculated statistics win and the stale conclusion
+    stops applying.
+    """
+    if not decision or status not in ("flagged", "blank"):
+        return None
+    note = f"；{decision['note']}" if decision.get("note") else ""
+    res = decision["resolution"]
+    if res == "skip":
+        return "skipped", None, "人工核对：跳过（不计入）" + note
+    if res == "blank":
+        return "blank", None, "人工核对：漏答" + note
+    if res.startswith("opt:") and res[4:] in option_universe:
+        chosen = res[4:]
+        return "counted", chosen, "人工核对：" + chosen + note
+    return None
+
+
+# --------------------------------------------------------------------------
+# Paired-option query over a saved snapshot
+# --------------------------------------------------------------------------
+
+DETAIL_VERSION = 1
+
+
+def load_detail(raw):
+    """Parse a snapshot's stored judgement data, or None if unavailable."""
+    if not raw:
+        return None
+    try:
+        detail = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(detail, dict) or detail.get("version") != DETAIL_VERSION:
+        return None
+    if not isinstance(detail.get("forms"), list) or not isinstance(detail.get("cards"), list):
+        return None
+    return detail
+
+
+def detail_questions(detail) -> "OrderedDict[str, list[str]]":
+    """Question codes and their option universe as recorded in a snapshot."""
+    options: dict[str, set[str]] = {}
+    for form in detail["forms"]:
+        for question in form.get("questions", []):
+            options.setdefault(question["std_code"], set()).update(question.get("letters", {}).values())
+    return OrderedDict(
+        (code, sorted(options[code], key=_natural_key))
+        for code in sorted(options, key=_natural_key)
+    )
+
+
+def _normalise(question: dict, rows: dict) -> str:
+    row = rows.get(question["q_no"]) or {}
+    letter = (row.get("letter") or "").strip()
+    if not letter:
+        return ""
+    return question.get("letters", {}).get(letter, "")
+
+
+def pair_query(detail, q1: str, o1: str, q2: str, o2: str) -> dict:
+    """Min/max share of cards answering ``o2`` on the second question among
+    cards that answered ``o1`` on the first one.
+
+    Every card with at least one compatible form independently picks one of
+    those forms -- the snapshot's already-judged compatible forms are reused,
+    never re-derived.  A pick counts in the denominator when that form printed
+    both questions and the card's first answer normalises to ``o1``.  It counts
+    in the numerator too when the second answer normalises to ``o2``; a blank
+    or different second answer stays in the denominator.
+
+    Different picks per card form the possible "配卷情形".  The function
+    returns the smallest and largest ratio over all scenarios whose denominator
+    is non-zero, each with a numerator/denominator pair that reaches it.
+    """
+    options = detail_questions(detail)
+    if q1 == q2:
+        raise ValidationError("两道标准题必须不同")
+    if q1 not in options or q2 not in options:
+        raise ValidationError("所选标准题不在该快照中")
+    if o1 not in options[q1]:
+        raise ValidationError(f"标准题 {q1} 在该快照中没有选项 {o1}")
+    if o2 not in options[q2]:
+        raise ValidationError(f"标准题 {q2} 在该快照中没有选项 {o2}")
+
+    forms: dict[int, dict] = {}
+    for form in detail["forms"]:
+        by_code = {
+            question["std_code"]: question
+            for question in form.get("questions", [])
+        }
+        forms[form["id"]] = {
+            "name": form.get("name", ""),
+            q1: by_code.get(q1),
+            q2: by_code.get(q2),
+        }
+
+    # Per card, the set of possible (denominator, numerator) contributions.
+    # A card "can be excluded" when one of its allowed forms does not print
+    # both questions or its first answer does not normalise to o1.
+    outcomes_by_card: list[set[tuple[int, int]]] = []
+    for card in detail["cards"]:
+        rows = {row["q_no"]: row for row in card.get("rows", [])}
+        outcomes: set[tuple[int, int]] = set()
+        for form_id in card.get("form_ids", []):
+            form = forms.get(form_id)
+            if form is None:
+                outcomes.add((0, 0))
+                continue
+            first, second = form[q1], form[q2]
+            if first is None or second is None:
+                # This form did not print both questions: the card cannot use
+                # it for this pair.
+                outcomes.add((0, 0))
+                continue
+            if _normalise(first, rows) != o1:
+                outcomes.add((0, 0))
+                continue
+            outcomes.add((1, 1) if _normalise(second, rows) == o2 else (1, 0))
+        if not outcomes:
+            outcomes.add((0, 0))
+        outcomes_by_card.append(outcomes)
+
+    cards_total = len(outcomes_by_card)
+    cards_judged = sum(1 for s in outcomes_by_card if s != {(0, 0)})
+
+    forced = [s for s in outcomes_by_card if (0, 0) not in s]  # always in denominator
+    optional = [s for s in outcomes_by_card if (0, 0) in s]
+
+    contributes = any((1, 0) in s or (1, 1) in s for s in outcomes_by_card)
+    no_sample = not contributes
+
+    def band(numerator: int, denominator: int):
+        return {
+            "numerator": numerator,
+            "denominator": denominator,
+            "ratio": (numerator / denominator) if denominator else None,
+        }
+
+    min_band = max_band = None
+    if not no_sample:
+        forced_zero = sum(1 for s in forced if (1, 0) not in s)      # only (1,1)
+        optional_zero = sum(1 for s in optional if (1, 0) in s)      # can add a 0
+        optional_one = sum(1 for s in optional if (1, 1) in s)
+
+        # Smallest share: all forced cards join (with a zero answer whenever
+        # the form offers one), plus every optional card offering a zero
+        # answer.  Cards that can only answer the target are left out unless
+        # the denominator would otherwise be zero.
+        min_num = forced_zero
+        min_den = len(forced) + optional_zero
+        if min_den == 0:
+            min_den = 1
+            min_num = 1 if optional_one else 0
+
+        # Largest share: every card that can answer the target does so and
+        # no card is dropped if it would take the denominator below one;
+        # otherwise only cards that cannot be excluded remain.
+        max_num = sum(1 for s in outcomes_by_card if (1, 1) in s)
+        max_den = len(forced) + optional_one
+        if max_den == 0:
+            max_den = 1  # only zero answers are available: 0 / 1
+            max_num = 0
+
+        min_band, max_band = band(min_num, min_den), band(max_num, max_den)
+
+    return {
+        "q1": q1, "o1": o1, "q2": q2, "o2": o2,
+        "cards_total": cards_total,
+        "cards_judged": cards_judged,
+        "no_sample": no_sample,
+        "min": min_band,
+        "max": max_band,
+        "options": options,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -379,13 +583,24 @@ def compute(conn) -> Analysis:
 def persist_run(conn, analysis: Analysis, created_at: str) -> int:
     """Insert a full snapshot and return its run id. Caller owns the transaction."""
     cur = conn.execute(
-        "INSERT INTO runs(created_at, summary_json) VALUES (?, '{}')", (created_at,)
+        "INSERT INTO runs(created_at, summary_json, detail_json) VALUES (?, '{}', NULL)",
+        (created_at,),
     )
     run_id = cur.lastrowid
-    import json
     conn.execute(
-        "UPDATE runs SET summary_json = ? WHERE id = ?",
-        (json.dumps(analysis.summary(), ensure_ascii=False), run_id),
+        "UPDATE runs SET summary_json = ?, detail_json = ? WHERE id = ?",
+        (
+            json.dumps(analysis.summary(), ensure_ascii=False),
+            json.dumps(
+                {
+                    "version": 1,
+                    "forms": analysis.forms,
+                    "cards": analysis.cards,
+                },
+                ensure_ascii=False,
+            ),
+            run_id,
+        ),
     )
     conn.executemany(
         "INSERT INTO run_question_stats(run_id, std_code, counted, blank, flagged) "

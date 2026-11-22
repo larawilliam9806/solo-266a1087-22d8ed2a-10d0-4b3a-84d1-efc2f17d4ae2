@@ -1,0 +1,166 @@
+{% extends "base.html" %}
+{% block title %}配卷查询{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>配卷查询</h2>
+  <p class="muted">
+    选择一份保留的快照、两道不同的标准题，以及每题要查的标准选项。
+    仅统计实扫作答：每张有相容卷式的卡独立取其中一种相容卷式；
+    该卷式出了这两道题、且首题作答归一后是所选项时，该卡计入分母；
+    次题也归一为所选项才计入分子（次题空答仍留在分母）。
+  </p>
+  <form method="get" action="{{ url_for('pair_query') }}" id="pair-form">
+    <select name="run" id="pair-run" required>
+      <option value="">选择快照</option>
+      {% for r in runs %}
+        <option value="{{ r.id }}" {% if run and r.id == run.id %}selected{% endif %}>
+          #{{ r.id }} · {{ r.created_at }}{% if not r.has_detail %}（无判定资料）{% endif %}
+        </option>
+      {% endfor %}
+    </select>
+
+    <label class="field">
+      <span class="muted small">首题（分母题）</span>
+      <select name="q1" id="pair-q1" required>
+        <option value="">题型</option>
+        {% for code, opts in (questions or {}).items() %}
+          <option value="{{ code }}" {% if code == q1 %}selected{% endif %}>{{ code }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <select name="o1" id="pair-o1" required>
+      <option value="">标准选项</option>
+      {% for opt in (questions or {}).get(q1, []) %}
+        <option value="{{ opt }}" {% if opt == o1 %}selected{% endif %}>{{ opt }}</option>
+      {% endfor %}
+    </select>
+
+    <label class="field">
+      <span class="muted small">次题（分子题）</span>
+      <select name="q2" id="pair-q2" required>
+        <option value="">题型</option>
+        {% for code, opts in (questions or {}).items() %}
+          <option value="{{ code }}" {% if code == q2 %}selected{% endif %}>{{ code }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <select name="o2" id="pair-o2" required>
+      <option value="">标准选项</option>
+      {% for opt in (questions or {}).get(q2, []) %}
+        <option value="{{ opt }}" {% if opt == o2 %}selected{% endif %}>{{ opt }}</option>
+      {% endfor %}
+    </select>
+
+    <button type="submit">查询</button>
+  </form>
+  {% if run and not detail and not error %}
+    <p class="banner info">该快照缺少判定资料，无法分析；请改选较新的快照。</p>
+  {% endif %}
+</section>
+
+{% if error %}
+<section class="card">
+  <p class="banner error">{{ error }}</p>
+</section>
+{% endif %}
+
+{% if result %}
+<section class="card">
+  <div class="row-between">
+    <h2>
+      快照 #{{ run.id }} · {{ run.created_at }}
+      <span class="muted small">首题 {{ result.q1 }} = {{ result.o1 }}，次题 {{ result.q2 }} = {{ result.o2 }}</span>
+    </h2>
+    <a class="button ghost" href="{{ url_for('run_detail', run_id=run.id) }}">查看该快照</a>
+  </div>
+  {% if result.no_sample %}
+    <p class="banner info">无样本：所有配卷情形下分母均为零，没有可统计的卡。</p>
+  {% else %}
+    <div class="table-wrap">
+    <table class="stats pair-result">
+      <thead>
+        <tr>
+          <th>比例</th>
+          <th>分子 / 分母</th>
+          <th>比例值</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>最小</td>
+          <td>{{ result.min.numerator }} / {{ result.min.denominator }}</td>
+          <td class="code">{{ '%.2f%%'|format(result.min.ratio * 100) }}</td>
+        </tr>
+        <tr>
+          <td>最大</td>
+          <td>{{ result.max.numerator }} / {{ result.max.denominator }}</td>
+          <td class="code">{{ '%.2f%%'|format(result.max.ratio * 100) }}</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+    <p class="muted small">
+      共 {{ result.cards_total }} 张卡，其中 {{ result.cards_judged }} 张至少有一种相容卷式能出这两道题。
+      同一张卡的相容卷式取自该快照当时的判定，之后换交答题或订正卷式不影响本结果。
+    </p>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const options = {{ (questions or {})|tojson }};
+  const q1 = document.getElementById('pair-q1');
+  const q2 = document.getElementById('pair-q2');
+  const o1 = document.getElementById('pair-o1');
+  const o2 = document.getElementById('pair-o2');
+  const runSel = document.getElementById('pair-run');
+  const form = document.getElementById('pair-form');
+  if (!q1 || !q2 || !o1 || !o2) return;
+
+  const selected = {{ {'q1': q1, 'o1': o1, 'q2': q2, 'o2': o2}|tojson }};
+
+  function fill(questionSelect, optionSelect, keep) {
+    const code = questionSelect.value;
+    optionSelect.innerHTML = '<option value="">标准选项</option>';
+    (options[code] || []).forEach(function (opt) {
+      const el = document.createElement('option');
+      el.value = opt;
+      el.textContent = opt;
+      if (opt === keep) el.selected = true;
+      optionSelect.appendChild(el);
+    });
+  }
+
+  function sync() {
+    fill(q1, o1, selected.o1);
+    fill(q2, o2, selected.o2);
+  }
+
+  q1.addEventListener('change', function () {
+    selected.o1 = '';
+    fill(q1, o1, '');
+    // Two different standard questions: nudge the second select away.
+    if (q2.value === q1.value) {
+      q2.value = '';
+      fill(q2, o2, '');
+    }
+  });
+  q2.addEventListener('change', sync);
+
+  sync();
+
+  if (runSel) {
+    runSel.addEventListener('change', function () {
+      // Options depend on the snapshot; submit only the snapshot selector so
+      // stale question/option parameters are dropped.
+      form.querySelectorAll('select[name=q1], select[name=q2], select[name=o1], select[name=o2]')
+        .forEach(function (el) { el.disabled = true; });
+      form.submit();
+    });
+  }
+})();
+</script>
+{% endblock %}

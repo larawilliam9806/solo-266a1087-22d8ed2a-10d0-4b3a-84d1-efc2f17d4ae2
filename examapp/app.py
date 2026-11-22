@@ -455,6 +455,11 @@ def register_routes(app: Flask):
         if view is None:
             return render_template("missing.html"), 404
         current = active_run_id(conn)
+        detail = engine.load_detail(
+            conn.execute(
+                "SELECT detail_json FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()["detail_json"]
+        )
         review_card = request.args.get("card", "").strip()
         review_code = request.args.get("code", "").strip()
         review_rows = []
@@ -468,9 +473,67 @@ def register_routes(app: Flask):
             job=job_view(latest_job(conn)), recomputing=is_recomputing(conn),
             active_run_id=current,
             forms=conn.execute("SELECT id, name FROM forms ORDER BY name").fetchall(),
+            pair_available=detail is not None,
             review_card=review_card,
             review_code=review_code, review_rows=review_rows,
             error=request.args.get("error"), message=request.args.get("message"),
+        )
+
+    @app.get("/pair")
+    def pair_query():
+        conn = get_db()
+        runs = [
+            {**dict(r), "summary": json.loads(r["summary_json"] or "{}"),
+             "has_detail": bool(r["has_detail"])}
+            for r in conn.execute(
+                "SELECT id, created_at, summary_json, "
+                "(detail_json IS NOT NULL) AS has_detail "
+                "FROM runs ORDER BY id DESC"
+            )
+        ]
+        try:
+            run_id = int(request.args.get("run") or 0)
+        except ValueError:
+            run_id = 0
+        if not run_id and runs:
+            run_id = active_run_id(conn) or runs[0]["id"]
+        run = next((r for r in runs if r["id"] == run_id), None)
+        if run_id and run is None:
+            return render_template(
+                "missing.html", message=f"找不到快照 #{run_id}"
+            ), 404
+
+        detail = None
+        if run is not None and run["has_detail"]:
+            row = conn.execute(
+                "SELECT detail_json FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            detail = engine.load_detail(row["detail_json"])
+        questions = engine.detail_questions(detail) if detail else None
+
+        q1 = (request.args.get("q1") or "").strip()
+        o1 = (request.args.get("o1") or "").strip()
+        q2 = (request.args.get("q2") or "").strip()
+        o2 = (request.args.get("o2") or "").strip()
+        result = error = None
+        submitted = bool(q1 or q2 or o1 or o2)
+        if submitted:
+            if detail is None:
+                error = "该快照缺少判定资料，无法分析"
+            elif not (q1 and o1 and q2 and o2):
+                error = "请选择两道标准题及每题的选项"
+            else:
+                try:
+                    result = engine.pair_query(detail, q1, o1, q2, o2)
+                except engine.ValidationError as exc:
+                    error = str(exc)
+
+        return render_template(
+            "pair.html", runs=runs, run=run, detail=detail,
+            questions=questions,
+            q1=q1, o1=o1, q2=q2, o2=o2,
+            result=result, submitted=submitted, error=error,
+            job=job_view(latest_job(conn)), recomputing=is_recomputing(conn),
         )
 
     @app.get("/cards")

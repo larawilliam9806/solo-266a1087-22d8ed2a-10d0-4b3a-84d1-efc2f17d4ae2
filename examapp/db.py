@@ -51,7 +51,10 @@ CREATE TABLE IF NOT EXISTS review_decisions (
 CREATE TABLE IF NOT EXISTS runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at   TEXT NOT NULL,
-    summary_json TEXT NOT NULL DEFAULT '{}'
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    -- Snapshot of the judgement inputs (forms, card rows and the compatible
+    -- forms judged per card) needed to query this run after forms change.
+    detail_json  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS run_question_stats (
@@ -128,6 +131,7 @@ def init_db(db_path: str) -> None:
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('active_run_id', '0')"
         )
@@ -142,6 +146,17 @@ def init_db(db_path: str) -> None:
         )
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring databases created by older versions up to the current schema."""
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(runs)")
+    }
+    if "detail_json" not in columns:
+        # Older snapshots stay readable but report that paired-option
+        # queries are unavailable for them.
+        conn.execute("ALTER TABLE runs ADD COLUMN detail_json TEXT")
 
 
 def get_meta(conn: sqlite3.Connection, key: str, default: str = "0") -> str:

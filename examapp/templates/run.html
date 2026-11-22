@@ -9,6 +9,9 @@
       <span class="muted small">{{ run.created_at }}</span>
     </h2>
     <a class="button ghost" href="{{ url_for('export_run', run_id=run.id) }}">导出 CSV</a>
+    {% if pair_available %}
+      <a class="button ghost" href="{{ url_for('pair_query', run=run.id) }}">配卷查询</a>
+    {% endif %}
   </div>
   {% if not is_current %}
     <p class="banner info">这是旧快照，只读展示；当前生效统计见
